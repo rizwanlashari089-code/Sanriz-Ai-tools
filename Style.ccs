@@ -100,4 +100,287 @@ app.post('/api/generate', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 5000);
+"handlebars": "^4.7.8",  // For template rendering
+"stripe": "^13.0.0",     // For payments
+"sharp": "^0.32.0",      // For image compression
+"fs-extra": "^11.1.1",   // For file operations
+"axios": "^1.5.0"        // For API calls (e.g., CDN)const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const { OpenAI } = require('openai');
+const fs = require('fs-extra');
+const path = require('path');
+const Handlebars = require('handlebars');
+const sharp = require('sharp');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const axios = require('axios');
+const { exec } = require('child_process');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+
+// User Schema (expanded)
+const userSchema = new mongoose.Schema({
+  email: String,
+  businessName: String,
+  businessType: String,
+  keywords: String,
+  websiteUrl: String,
+  logoUrl: String,
+  brandColors: [String], // Array of hex colors
+  stripeCustomerId: String, // For billing
+  products: [{ name: String, description: String, price: Number }], // Basic eCommerce
+});
+const User = mongoose.model('User', userSchema);
+
+// OpenAI Setup
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Helper: Generate Logo
+async function generateLogo(businessName) {
+  const response = await openai.images.generate({
+    model: 'dall-e-3',
+    prompt: `Create a modern, professional logo for a ${businessName} business. Vector style, simple.`,
+    n: 1,
+    size: '1024x1024',
+  });
+  return response.data[0].url;
+}
+
+// Helper: Select Brand Colors (simple AI-based selection)
+function selectBrandColors(businessType) {
+  const colorMap = {
+    retail: ['#FF5733', '#33FF57'], // Red and green for sales
+    consulting: ['#3357FF', '#F0F0F0'], // Blue and neutral
+    default: ['#000000', '#FFFFFF'],
+  };
+  return colorMap[businessType] || colorMap.default;
+}
+
+// Helper: Compress Image
+async function compressImage(imageUrl, outputPath) {
+  const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+  await sharp(response.data).resize(500).jpeg({ quality: 80 }).toFile(outputPath);
+}
+
+// API: Signup (unchanged, but now includes Stripe customer creation)
+app.post('/api/signup', async (req, res) => {
+  const { email, password } = req.body;
+  const customer = await stripe.customers.create({ email });
+  const user = new User({ email, stripeCustomerId: customer.id });
+  await user.save();
+  res.json({ message: 'User created', userId: user._id });
+});
+
+// API: Generate Website (expanded)
+app.post('/api/generate', async (req, res) => {
+  const { userId, businessName, businessType, keywords, customDomain } = req.body;
+  const user = await User.findById(userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  setProgress('Generating logo...');
+  const logoUrl = await generateLogo(businessName);
+  const compressedLogoPath = `./sites/${userId}/logo.jpg`;
+  await compressImage(logoUrl, compressedLogoPath);
+  user.logoUrl = `https://your-cdn.com/sites/${userId}/logo.jpg`; // Assume CDN upload
+
+  setProgress('Selecting brand colors...');
+  user.brandColors = selectBrandColors(businessType);
+
+  setProgress('Generating content...');
+  const pages = ['home', 'about', 'services', 'contact'];
+  const content = {};
+  for (const page of pages) {
+    const prompt = `Write SEO-optimized HTML content for the ${page} page of a ${businessType} website. Business: ${businessName}. Keywords: ${keywords}. Include meta tags and schema markup.`;
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 1500,
+    });
+    content[page] = response.choices[0].message.content;
+  }
+
+  // Blog Auto-Creation: Generate 3 blog posts
+  const blogPosts = [];
+  for (let i = 1; i <= 3; i++) {
+    const blogPrompt = `Write a blog post about ${keywords} for ${businessName}. SEO-optimized.`;
+    const blogResponse = await openai.chat.completions.create({
+      model: 'gpt-4',
+      messages: [{ role: 'user', content: blogPrompt }],
+      max_tokens: 1000,
+    });
+    blogPosts.push(blogResponse.choices[0].message.content);
+  }
+
+  setProgress('Rendering template...');
+  const templatePath = path.join(__dirname, 'templates', 'responsive-template.hbs');
+  const templateSource = fs.readFileSync(templatePath, 'utf8');
+  const template = Handlebars.compile(templateSource);
+  const html = template({
+    businessName,
+    logoUrl: user.logoUrl,
+    brandColors: user.brandColors,
+    content,
+    blogPosts,
+  });
+
+  // Generate sitemap.xml and robots.txt
+  const sitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://${customDomain}</loc></url></urlset>`;
+  const robots = `User-agent: *\nAllow: /\nSitemap: https://${customDomain}/sitemap.xml`;
+
+  const siteDir = `./sites/${userId}`;
+  fs.ensureDirSync(siteDir);
+  fs.writeFileSync(`${siteDir}/index.html`, html);
+  fs.writeFileSync(`${siteDir}/sitemap.xml`, sitemap);
+  fs.writeFileSync(`${siteDir}/robots.txt`, robots);
+
+  setProgress('Setting up SSL and domain...');
+  // Simulate SSL (in production, use Let's Encrypt API)
+  // One-click domain: Assume API call to update DNS (e.g., via Cloudflare API)
+  await axios.post('https://api.cloudflare.com/client/v4/zones/YOUR_ZONE_ID/dns_records', {
+    type: 'CNAME',
+    name: customDomain,
+    content: 'your-vercel-deployment-url.vercel.app', // Replace with actual
+    headers: { 'Authorization': `Bearer ${process.env.CLOUDFLARE_TOKEN}` }
+  });
+
+  setProgress('Deploying...');
+  exec(`cd ${siteDir} && vercel --prod --yes`, (error, stdout, stderr) => {
+    if (error) return res.status(500).json({ error: 'Deployment failed' });
+    const websiteUrl = stdout.match(/https:\/\/[^\s]+/)[0];
+    user.websiteUrl = websiteUrl;
+    user.save();
+    res.json({ message: 'Website generated and deployed!', url: websiteUrl });
+  });
+});
+
+// API: Add Product (for eCommerce)
+app.post('/api/add-product', async (req, res) => {
+  const { userId, name, description, price } = req.body;
+  const user = await User.findById(userId);
+  user.products.push({ name, description, price });
+  await user.save();
+  res.json({ message: 'Product added' });
+});
+
+// API: Create Payment Intent (Stripe)
+app.post('/api/create-payment-intent', async (req, res) => {
+  const { amount, currency = 'usd' } = req.body;
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: amount * 100, // Cents
+    currency,
+  });
+  res.json({ clientSecret: paymentIntent.client_secret });
+});
+
+app.listen(5000, () => console.log('Backend running on port 5000'));STRIPE_SECRET_KEY=your_stripe_secret_key
+CLOUDFLARE_TOKEN=your_cloudflare_api_token<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{businessName}} - Home</title>
+  <meta name="description" content="SEO description for {{businessName}}">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "name": "{{businessName}}"
+  }
+  </script>
+  <style>
+    body { background-color: {{brandColors.[0]}}; color: {{brandColors.[1]}}; }
+    .logo { max-width: 200px; }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="{{logoUrl}}" alt="Logo" class="logo">
+    <h1>{{businessName}}</h1>
+  </header>
+  <section id="home">{{{content.home}}}</section>
+  <section id="about">{{{content.about}}}</section>
+  <section id="services">{{{content.services}}}</section>
+  <section id="contact">{{{content.contact}}}</section>
+  <section id="blog">
+    {{#each blogPosts}}
+      <article>{{{this}}}</article>
+    {{/each}}
+  </section>
+  <footer>© {{businessName}}</footer>
+</body>
+</html>import React, { useState } from 'react';
+import axios from 'axios';
+
+function App() {
+  const [step, setStep] = useState('signup');
+  const [userId, setUserId] = useState('');
+  const [formData, setFormData] = useState({});
+  const [progress, setProgress] = useState('');
+  const [products, setProducts] = useState([]);
+
+  const handleSignup = async (e) => {
+    e.preventDefault();
+    const res = await axios.post('http://localhost:5000/api/signup', formData);
+    setUserId(res.data.userId);
+    setStep('generate');
+  };
+
+  const handleGenerate = async (e) => {
+    e.preventDefault();
+    setProgress('Starting generation...');
+    const res = await axios.post('http://localhost:5000/api/generate', { userId, ...formData });
+    setProgress(`Website ready! URL: ${res.data.url}`);
+    setStep('manage');
+  };
+
+  const handleAddProduct = async (e) => {
+    e.preventDefault();
+    await axios.post('http://localhost:5000/api/add-product', { userId, ...formData });
+    setProducts([...products, formData]);
+  };
+
+  return (
+    <div>
+      {step === 'signup' && (
+        <form onSubmit={handleSignup}>
+          <input placeholder="Email" onChange={(e) => setFormData({ ...formData, email: e.target.value })} />
+          <input placeholder="Password" type="password" onChange={(e) => setFormData({ ...formData, password: e.target.value })} />
+          <button type="submit">Sign Up</button>
+        </form>
+      )}
+      {step === 'generate' && (
+        <form onSubmit={handleGenerate}>
+          <input placeholder="Business Name" onChange={(e) => setFormData({ ...formData, businessName: e.target.value })} />
+          <input placeholder="Business Type" onChange={(e) => setFormData({ ...formData, businessType: e.target.value })} />
+          <input placeholder="Keywords" onChange={(e) => setFormData({ ...formData, keywords: e.target.value })} />
+          <input placeholder="Custom Domain" onChange={(e) => setFormData({ ...formData, customDomain: e.target.value })} />
+          <button type="submit">Generate Website</button>
+          <p>{progress}</p>
+        </form>
+      )}
+      {step === 'manage' && (
+        <div>
+          <h2>Manage Your Site</h2>
+          <form onSubmit={handleAddProduct}>
+            <input placeholder="Product Name" onChange={(e) => setFormData({ ...formData, name: e.target.value })} />
+            <input placeholder="Description" onChange={(e) => setFormData({ ...formData, description: e.target.value })} />
+            <input placeholder="Price" type="number" onChange={(e) => setFormData({ ...formData, price: e.target.value })} />
+            <button type="submit">Add Product</button>
+          </form>
+          <ul>
+            {products.map((p, i) => <li key={i}>{p.name} - ${p.price}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
 
