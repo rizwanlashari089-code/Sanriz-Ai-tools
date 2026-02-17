@@ -1,0 +1,103 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const { OpenAI } = require('openai');
+const fs = require('fs-extra');
+const path = require('path');
+const Handlebars = require('handlebars');
+const sharp = require('sharp');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const axios = require('axios');
+const { exec } = require('child_process');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+
+const userSchema = new mongoose.Schema({
+  email: String,
+  businessName: String,
+  businessType: String,
+  keywords: String,
+  websiteUrl: String,
+  logoUrl: String,
+  brandColors: [String],
+  stripeCustomerId: String,
+  products: [{ name: String, description: String, price: Number }],
+});
+const User = mongoose.model('User', userSchema);
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+async function generateLogo(businessName) {
+  const response = await openai.images.generate({
+    model: 'dall-e-3',
+    prompt: `Professional vector logo for ${businessName}`,
+    n: 1,
+    size: '1024x1024',
+  });
+  return response.data[0].url;
+}
+
+function selectBrandColors(businessType) {
+  const colorMap = {
+    retail: ['#FF5733', '#33FF57'],
+    consulting: ['#3357FF', '#F0F0F0'],
+    default: ['#000000', '#FFFFFF'],
+  };
+  return colorMap[businessType] || colorMap.default;
+}
+
+async function compressImage(imageUrl, outputPath) {
+  const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+  await sharp(response.data).resize(500).jpeg({ quality: 80 }).toFile(outputPath);
+}
+
+app.post('/api/signup', async (req, res) => {
+  const { email } = req.body;
+  const customer = await stripe.customers.create({ email });
+  const user = new User({ email, stripeCustomerId: customer.id });
+  await user.save();
+  res.json({ userId: user._id });
+});
+
+app.post('/api/generate', async (req, res) => {
+  const { userId, businessName, businessType, keywords, customDomain } = req.body;
+  const user = await User.findById(userId);
+  if (!user) return res.status(404).send('User not found');
+
+  const logoUrl = await generateLogo(businessName);
+  const siteDir = `./sites/${userId}`;
+  fs.ensureDirSync(siteDir);
+  await compressImage(logoUrl, `${siteDir}/logo.jpg`);
+  
+  user.logoUrl = `/logo.jpg`;
+  user.brandColors = selectBrandColors(businessType);
+
+  const prompt = `Generate SEO HTML for ${businessName} (${businessType}) using keywords: ${keywords}. Return only content for home, about, services, contact.`;
+  const response = await openai.chat.completions.create({
+    model: 'gpt-3.5-turbo',
+    messages: [{ role: 'user', content: prompt }],
+  });
+  
+  const content = { home: response.choices[0].message.content };
+  const templateSource = `<!DOCTYPE html><html><head><title>{{businessName}}</title><style>body{background:{{brandColors.[0]}};color:{{brandColors.[1]}}}</style></head><body><img src="{{logoUrl}}"><h1>{{businessName}}</h1><div>{{{content.home}}}</div></body></html>`;
+  const template = Handlebars.compile(templateSource);
+  const html = template({ businessName, logoUrl: user.logoUrl, brandColors: user.brandColors, content });
+
+  fs.writeFileSync(`${siteDir}/index.html`, html);
+
+  exec(`cd ${siteDir} && vercel --prod --yes`, async (error, stdout) => {
+    if (error) return res.status(500).send('Error');
+    const url = stdout.match(/https:\/\/[^\s]+/)[0];
+    user.websiteUrl = url;
+    await user.save();
+    res.json({ url });
+  });
+});
+
+app.listen(process.env.PORT || 5000);
+
